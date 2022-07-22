@@ -1,9 +1,12 @@
-import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, Props}
+import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, DeadLetter, Props}
 
 import java.util.concurrent.ThreadLocalRandom
 import java.util.{Calendar, Date, UUID}
 import scala.collection.mutable.ListBuffer
 import java.time.LocalDate
+import scala.util.{Success, Failure}
+import scala.concurrent.Future
+import scala.concurrent.ExecutionContext.Implicits.global
 
 /**
  * any case object or case class with a parameter sender_ is one which can be  implemented without it
@@ -124,13 +127,29 @@ class ReservationService(propertyId: UUID, client: Client, date: LocalDate) exte
 
   def receive: Receive = {
     case AddReservation(sender_) =>
-      if(isReservationAvailable(propertyId, client, date)){
-        //@ams -> This date might have already been reserved by someone from a different booking system
+      /**
+       * @ams -> This date might have already been reserved by someone from a different booking system
+       * I will assume the ReservationService does update the all SystemService actors
+       * connected to it, when a Property is booked, so that they can marked it as unavailable on that date
+       */
+      //if(isReservationAvailable(propertyId, client, date)){
       RandomValues.reservations += Reservation(propertyId, client, date)
       sender() ! PropertyReserved(s"A reservation has been successfully made for ${client.name}", sender_)
-      }else {
-        sender() ! NotReserved(s"A reservation cannot be made for ${client.name} on ${date}.", sender_)
-      }
+    //      }else {
+    //        sender() ! NotReserved(s"A reservation cannot be made for ${client.name} on ${date}.", sender_)
+    //      }
+    //      val f: Future[Boolean] = Future {
+    //        val reservation = RandomValues.reservations.filter(reservation => reservation.propertyId.equals(propertyId) &&
+    //          reservation.date.equals(date))
+    //        if(reservation.isEmpty) true
+    //        else false
+    //      }
+    //      f.onComplete {
+    //        case Success(f) => //@ams -> This date might have already been reserved by someone from a different booking system
+    //          RandomValues.reservations += Reservation(propertyId, client, date)
+    //          sender() ! PropertyReserved(s"A reservation has been successfully made for ${client.name}", sender_)
+    //        case Failure(f) => sender() ! NotReserved(s"A reservation cannot be made for ${client.name} on ${date}.", sender_)
+    //      }
     case RemoveReservation(sender_) =>
       RandomValues.reservations -= Reservation(propertyId, client, date)
       sender() ! ReservationCancelled(client, propertyId, date, sender_)
@@ -140,8 +159,8 @@ class ReservationService(propertyId: UUID, client: Client, date: LocalDate) exte
      * Bad programming. iterating reservations and
      * updating it above at the same time. cuncurrent propblems might arise @ams-> Fix
      */
-    val reservation = RandomValues.reservations.filter(reservation => reservation.propertyId.equals(propertyId) &&
-      reservation.date.equals(date))
+    val reservation: ListBuffer[Reservation] = Some(RandomValues.reservations.filter(reservation => reservation.propertyId.equals(propertyId) &&
+      reservation.date.equals(date))).getOrElse(ListBuffer[Reservation]())
     if(reservation.isEmpty) true
     else false
   }
@@ -155,18 +174,19 @@ class ChildService(client: Client, propertyId: UUID, date: LocalDate, parent_ : 
         val reservationService: ActorRef = context.actorOf(Props(new ReservationService(propertyId, client, date)))
         reservationService ! AddReservation(sender_)
       }else{
-       val msg = s"Property cannot be reserved on ${date}. Please choose a different property or date."
+        val msg = s"Property cannot be reserved on ${date}. Please choose a different property or date."
+        parent_ ! ReservationFailed
         replyTo ! ChooseDifferentProperty(msg)
       }
     case PropertyReserved(msg, sender_) =>
       parent_ ! Reserved(propertyId, client, date) //the parent
-//      replyTo ! ReservationCornfirmed(msg, propertyId, date)
+      //      replyTo ! ReservationCornfirmed(msg, propertyId, date)
       sender_ ! ReservationCornfirmed(msg, propertyId, date)
       context.stop(self)
-    case NotReserved(msg, sender_) =>
-      parent_ ! ReservationFailed
-      sender_ ! NotReserved(msg, sender_)
-      context.stop(self)
+    //    case NotReserved(msg, sender_) =>
+    //      parent_ ! ReservationFailed
+    //      sender_ ! NotReserved(msg, sender_)
+    //      context.stop(self)
     case _ =>
   }
   def isPropertyAvailable(propertyId: UUID, client: Client, date: LocalDate): Boolean = {
@@ -223,7 +243,7 @@ class SystemService extends Actor with ActorLogging {
       RandomValues.bookings -= Reservation(propertyId, client, date)
       RandomValues.properties.foreach(property =>
         if(property.id == propertyId)
-        property.unavailability -= date
+          property.unavailability -= date
       )
       sender_ ! CancellationSuccesful(client.name, propertyId, date)
     case _ =>
@@ -239,23 +259,23 @@ class ClientActor(client: Client,
                   action : ListBuffer[Slug],
                   searchActor: ActorRef) extends Actor with ActorLogging{
 
-if(action.isEmpty) {
-  if(propertyType == Hotel){
-    searchActor ! SearchHotel(reservationDate)
-  }else if(propertyType == Apartment){
-    searchActor ! SearchApartment(reservationDate)
-  }else{ //Resort
-    searchActor ! SearchResort(reservationDate)
+  if(action.isEmpty) {
+    if(propertyType == Hotel){
+      searchActor ! SearchHotel(reservationDate)
+    }else if(propertyType == Apartment){
+      searchActor ! SearchApartment(reservationDate)
+    }else{ //Resort
+      searchActor ! SearchResort(reservationDate)
+    }
+  }else {
+    if(action(0).cancellation){  // true
+      log.info(s"${client.name} wishes to cancel a reservation at ${getPropertyName(action(0).propertyId)}.")
+      searchActor ! CancelReservation(action(0).propertyId, client, reservationDate) // reservaionDate is date at this moment.
+    }else{
+      log.info(s"${client.name} wishes to reserve an accommodation at ${getPropertyName(action(0).propertyId)} on ${reservationDate}")
+      searchActor ! MakeReservation(action(0).propertyId, client, reservationDate)
+    }
   }
-}else {
-  if(action(0).cancellation){  // true
-    log.info(s"${client.name} wishes to cancel a reservation at ${getPropertyName(action(0).propertyId)}.")
-    searchActor ! CancelReservation(action(0).propertyId, client, reservationDate) // reservaionDate is date at this moment.
-  }else{
-    log.info(s"${client.name} wishes to reserve an accommodation at ${getPropertyName(action(0).propertyId)} on ${reservationDate}")
-    searchActor ! MakeReservation(action(0).propertyId, client, reservationDate)
-  }
-}
 
   def rnd = ThreadLocalRandom.current
 
@@ -283,43 +303,49 @@ if(action.isEmpty) {
       .map(property => property.name).head
   }
 }
-
+class DeadLetterListener extends Actor {
+  def receive = {
+    case d: DeadLetter => println(d)
+  }
+}
 object Booking extends App {
 
   val system = ActorSystem("OnlineBooking")
   println(system)
   println("Welcome to Kijamii Booking")
   val searchActor = system.actorOf(Props[SystemService], "search")
+  val listener = system.actorOf(Props[DeadLetterListener])
+  system.eventStream.subscribe(listener, classOf[DeadLetter])
 
   val Client1 = system.actorOf(Props(new ClientActor(RandomValues.clients(0), Hotel, LocalDate.now, ListBuffer(), searchActor)), "searchHotel")
-  Thread.sleep(1000)
+  //  Thread.sleep(1000)
   val Client2 = system.actorOf(Props(new ClientActor(RandomValues.clients(1), Apartment, LocalDate.of(2022,7,29), ListBuffer(), searchActor)), "searchApartment")
-  Thread.sleep(1000)
+  //  Thread.sleep(1000)
   val Client3 = system.actorOf(Props(new ClientActor(RandomValues.clients(2), Resort, LocalDate.of(2022,7,26), ListBuffer(), searchActor)), "searchResort")
-  Thread.sleep(1000)
+  //  Thread.sleep(1000)
   val Client4 = system.actorOf(Props(new ClientActor(RandomValues.clients(3), Hotel, LocalDate.of(2022,7,27), ListBuffer(), searchActor)), "searchHotel2")
-  Thread.sleep(1000)
+  //  Thread.sleep(1000)
   val Client5 = system.actorOf(Props(new ClientActor(RandomValues.clients(4), Apartment, LocalDate.of(2022,7,30), ListBuffer(), searchActor)), "searchApartment2")
-  Thread.sleep(1000)
+  //  Thread.sleep(1000)
   val Client6 = system.actorOf(Props(new ClientActor(RandomValues.clients(5), Resort, LocalDate.of(2022,7,31), ListBuffer(), searchActor)), "searchResort2")
-  Thread.sleep(1000)
+  //  Thread.sleep(1000)
   val Client7 = system.actorOf(Props(new ClientActor(RandomValues.clients(6), Hotel, LocalDate.of(2022,7,25), ListBuffer(), searchActor)), "searchHotel3")
-  Thread.sleep(1000)
+  //  Thread.sleep(1000)
   val Client8 = system.actorOf(Props(new ClientActor(RandomValues.clients(7), Apartment, LocalDate.of(2022,7,22), ListBuffer(), searchActor)), "searchApartment3")
-  Thread.sleep(1000)
+  //  Thread.sleep(1000)
   val Client9 = system.actorOf(Props(new ClientActor(RandomValues.clients(8), Resort, LocalDate.of(2022,7,25), ListBuffer(), searchActor)), "searchResort3")
-  Thread.sleep(1000)
+  //  Thread.sleep(1000)
   val Client10 = system.actorOf(Props(new ClientActor(RandomValues.clients(9), Hotel, LocalDate.of(2022,7,22), ListBuffer(), searchActor)), "searchHotel4")
-  Thread.sleep(1000)
+  //  Thread.sleep(1000)
 
   /**
    * Uncomment these two to test for cancellation and reserving property upon cancellation
    */
-//  val cancelReservation = system.actorOf(Props(new ClientActor(RandomValues.clients(0), None, LocalDate.now,
-//    ListBuffer(Slug(true, UUID.fromString("fbd23f3f-3323-423f-8797-4d15c38f5cbf"))), searchActor)), "cancelReservation")
-//  Thread.sleep(1000)
-//  val reserveUponCancelled = system.actorOf(Props(new ClientActor(RandomValues.clients(6), None, LocalDate.of(2022,7,24),
-//    ListBuffer(Slug(false, UUID.fromString("fbd23f3f-3323-423f-8797-4d15c38f5cbf"))), searchActor)), "reserveUponCancelled")
+  val cancelReservation = system.actorOf(Props(new ClientActor(RandomValues.clients(0), None, LocalDate.now,
+    ListBuffer(Slug(true, UUID.fromString("fbd23f3f-3323-423f-8797-4d15c38f5cbf"))), searchActor)), "cancelReservation")
+  Thread.sleep(1000)
+  val reserveUponCancelled = system.actorOf(Props(new ClientActor(RandomValues.clients(6), None, LocalDate.of(2022,7,24),
+    ListBuffer(Slug(false, UUID.fromString("fbd23f3f-3323-423f-8797-4d15c38f5cbf"))), searchActor)), "reserveUponCancelled")
 
   Thread.sleep(5000)
   system.terminate()
